@@ -1,0 +1,148 @@
+// ===================================================================================
+// Deforestation Risk Mapping using Random Forest & Gradient Tree Boost (GEE)
+// ===================================================================================
+// Author: Mahasangram
+// ===================================================================================
+
+// --------------------------- Step 1: AOI ---------------------------
+var districtNames = ['Kandhamal','Rayagada','Kalahandi','Boudh','Ganjam','Nayagarh'];
+var adminBoundaries = ee.FeatureCollection('FAO/GAUL/2015/level2');
+var aoi = adminBoundaries.filter(ee.Filter.inList('ADM2_NAME', districtNames));
+Map.centerObject(aoi, 8);
+
+// --------------------- Step 2: Ground Truth Label -------------------
+var label = ee.Image('projects/nimble-anagram-464203-p7/assets/deforestation_label_Kandhamal_GeoTIFF')
+  .rename('class')
+  .clip(aoi);
+
+// -------------------- Step 3: Predictor Variables -------------------
+var dem = ee.Image('USGS/SRTMGL1_003').clip(aoi);
+var elevation = dem.select('elevation').rename('elevation');
+var slope = ee.Terrain.slope(dem).rename('slope');
+
+var travelTime = ee.Image('Oxford/MAP/accessibility_to_cities_2015_v1_0')
+  .clip(aoi).select('accessibility').rename('travel_time');
+
+var rivers = ee.FeatureCollection('WWF/HydroSHEDS/v1/FreeFlowingRivers');
+var majorRivers = rivers.filter(ee.Filter.gt('RIV_ORD', 4));
+var riverImage = ee.Image(0).byte().paint({
+  featureCollection: majorRivers, color: 1, width: 1
+}).unmask(0);
+var distanceToRivers = riverImage.not().cumulativeCost({
+  source: riverImage, maxDistance: 80000, geodeticDistance: true
+}).rename('distance_to_rivers');
+
+var population = ee.ImageCollection('WorldPop/GP/100m/pop')
+  .filterDate('2020-01-01','2020-12-31').mean().clip(aoi)
+  .rename('population_density');
+
+var ndvi = ee.ImageCollection('MODIS/006/MOD13Q1')
+  .filterDate('2020-01-01','2020-12-31')
+  .select('NDVI').mean().clip(aoi)
+  .multiply(0.0001).rename('ndvi');
+
+var nightlight = ee.ImageCollection('NOAA/VIIRS/DNB/MONTHLY_V1/VCMCFG')
+  .filterDate('2020-01-01','2020-12-31')
+  .select('avg_rad').mean().clip(aoi)
+  .rename('nightlight');
+
+var landcover = ee.ImageCollection('ESA/WorldCover/v200')
+  .first()
+  .select('Map')
+  .clip(aoi)
+  .rename('landcover');
+
+
+// ------------------ Step 4: Stack predictor layers ------------------
+var predictors = elevation
+  .addBands([slope, travelTime, distanceToRivers, population, ndvi, nightlight, landcover]);
+
+// -------------- Step 5: Per-band min-max normalization --------------
+function minMaxScale(image, region, scale) {
+  var bands = image.bandNames();
+  var stats = image.reduceRegion({
+    reducer: ee.Reducer.minMax(),
+    geometry: region,
+    scale: scale,
+    maxPixels: 1e13,
+    bestEffort: true
+  });
+  var mins = ee.Image.constant(bands.map(function(b){
+    return ee.Number(stats.get(ee.String(b).cat('_min')));
+  })).rename(bands);
+  var maxs = ee.Image.constant(bands.map(function(b){
+    return ee.Number(stats.get(ee.String(b).cat('_max')));
+  })).rename(bands);
+  return image.subtract(mins).divide(maxs.subtract(mins)).clamp(0,1);
+}
+var predictorsNorm = minMaxScale(predictors, aoi, 100);
+
+// ---------------- Step 6: Merge predictors with label ----------------
+var trainingImage = predictorsNorm.addBands(label);
+
+// ---- Step 7: Stratified sampling (balanced & larger sample) --------
+var sample = trainingImage.stratifiedSample({
+  numPoints: 12000,
+  classBand: 'class',
+  region: aoi,
+  scale: 100,
+  geometries: true,
+  seed: 42
+}).randomColumn('rand');
+
+var train = sample.filter(ee.Filter.lt('rand', 0.7));
+var valid = sample.filter(ee.Filter.gte('rand', 0.7));
+
+var featBands = predictorsNorm.bandNames();
+
+// --------------- Step 8: Train RF and GTB classifiers ---------------
+var rf = ee.Classifier.smileRandomForest({
+  numberOfTrees: 200,
+  variablesPerSplit: 3,
+  minLeafPopulation: 2,
+  bagFraction: 0.7,
+  seed: 42
+}).train({
+  features: train,
+  classProperty: 'class',
+  inputProperties: featBands
+});
+
+var gtb = ee.Classifier.smileGradientTreeBoost({
+  numberOfTrees: 300,
+  shrinkage: 0.05,      // Learning rate
+  samplingRate: 0.7,    // Equivalent to subsamplingRate
+  maxNodes: 40,         // Controls complexity of each tree
+  loss: 'LeastSquares',
+  seed: 42
+}).train({
+  features: train,
+  classProperty: 'class',
+  inputProperties: featBands
+});
+
+// ---------------------- Step 9: Inference (probability) ---------------------
+var rfProb = predictorsNorm.classify(rf.setOutputMode('PROBABILITY'));
+var gtbProb = predictorsNorm.classify(gtb.setOutputMode('PROBABILITY'));
+
+// -------------------- Step 10: Accuracy / Metrics --------------------
+function assess(model, name) {
+  var pred = valid.classify(model);
+  var cm = pred.errorMatrix('class', 'classification');
+  print('--- ' + name + ' ---');
+  print('Confusion Matrix (' + name + '):', cm);
+  print('Overall Accuracy (' + name + '):', cm.accuracy());
+  print('Kappa (' + name + '):', cm.kappa());
+}
+assess(rf, 'Random Forest');
+assess(gtb, 'Gradient Tree Boosting');
+
+// --------- Optional: variable importance (RF explain) ----------------
+print('RF feature importance:', ee.Dictionary(rf.explain().get('importance')));
+
+// ---------------------- Step 11: Visualization -----------------------
+var riskVis = {min: 0, max: 1, palette: ['green','yellow','orange','red']};
+Map.addLayer(gtbProb, riskVis, 'Deforestation Risk (GTB)');
+Map.addLayer(rfProb, riskVis, 'Deforestation Risk (RF)', false);
+Map.addLayer(label, {min:0, max:1, palette:['green','red']}, 'Ground Truth Label', false);
+Map.addLayer(aoi.style({color:'white', width:2, fillColor:'#FFFFFF00'}), {}, 'District Boundaries');
